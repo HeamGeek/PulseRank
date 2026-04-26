@@ -1,0 +1,10 @@
+{
+  "name": "pulserank",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Original ranked gym workout web app inspired by gamified fitness tracking.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
