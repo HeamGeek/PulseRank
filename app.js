@@ -2,6 +2,17 @@
  * PulseRank (Liftoff Replica) Engine - Senior Build
  */
 
+const APP_CONFIG = window.PULSE_CONFIG || {};
+const SUPABASE_URL = localStorage.getItem('pulse_supabase_url') || APP_CONFIG.supabaseUrl || '';
+const SUPABASE_ANON_KEY = localStorage.getItem('pulse_supabase_anon_key') || APP_CONFIG.supabaseAnonKey || '';
+const SUPABASE_READY = Boolean(window.supabase && SUPABASE_URL && SUPABASE_ANON_KEY);
+const supabaseClient = SUPABASE_READY ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    auth: {
+        persistSession: true,
+        autoRefreshToken: true
+    }
+}) : null;
+
 // --- Database & State ---
 const EXERCISES = [
     // CHEST
@@ -67,6 +78,8 @@ function parseHistoryFromStorage() {
 
 const STATE = {
     user: {
+        id: localStorage.getItem('pulse_user_id') || '',
+        email: localStorage.getItem('pulse_email') || '',
         name: localStorage.getItem('pulse_name') || '',
         age: parseInt(localStorage.getItem('pulse_age')) || null,
         bw: parseFloat(localStorage.getItem('pulse_bw')) || null,
@@ -74,10 +87,45 @@ const STATE = {
         xp: parseInt(localStorage.getItem('pulse_xp')) || 0
     },
     history: parseHistoryFromStorage(),
-    currentSessionSets: [] // Volatile, today's workout
+    currentSessionSets: [], // Volatile, today's workout
+    auth: {
+        mode: SUPABASE_READY ? 'cloud' : 'local',
+        ready: false,
+        session: null
+    }
 };
 
+function persistLocalIdentity() {
+    if (STATE.user.id) localStorage.setItem('pulse_user_id', STATE.user.id);
+    else localStorage.removeItem('pulse_user_id');
+
+    if (STATE.user.email) localStorage.setItem('pulse_email', STATE.user.email);
+    else localStorage.removeItem('pulse_email');
+}
+
+function clearUserCache() {
+    [
+        'pulse_user_id',
+        'pulse_email',
+        'pulse_name',
+        'pulse_age',
+        'pulse_bw',
+        'pulse_level',
+        'pulse_xp',
+        'pulse_history'
+    ].forEach(key => localStorage.removeItem(key));
+}
+
+function setConnectionStatus(statusText) {
+    const meta = document.getElementById('header-meta');
+    if (!meta) return;
+
+    meta.innerHTML = `<span style="font-size:12px; font-weight:600; color:var(--text-secondary);">${statusText}</span>`;
+}
+
 function saveState() {
+    persistLocalIdentity();
+
     if (STATE.user.name) localStorage.setItem('pulse_name', STATE.user.name);
     else localStorage.removeItem('pulse_name');
 
@@ -90,6 +138,165 @@ function saveState() {
     localStorage.setItem('pulse_level', STATE.user.level);
     localStorage.setItem('pulse_xp', STATE.user.xp);
     localStorage.setItem('pulse_history', JSON.stringify(STATE.history));
+}
+
+function snapshotProfile() {
+    return {
+        id: STATE.user.id,
+        display_name: STATE.user.name,
+        age: STATE.user.age,
+        bodyweight: STATE.user.bw,
+        level: STATE.user.level,
+        xp: STATE.user.xp
+    };
+}
+
+function applyProfile(profile, fallbackMeta = {}) {
+    if (!profile) return;
+
+    STATE.user.id = profile.id || STATE.user.id;
+    STATE.user.email = profile.email || fallbackMeta.email || STATE.user.email;
+    STATE.user.name = profile.display_name || profile.name || fallbackMeta.display_name || STATE.user.name;
+    
+    const age = profile.age ?? fallbackMeta.age;
+    const bodyweight = profile.bodyweight ?? fallbackMeta.bodyweight;
+    const level = profile.level ?? fallbackMeta.level;
+    const xp = profile.xp ?? fallbackMeta.xp;
+
+    if (age !== undefined && age !== null) STATE.user.age = Number(age);
+    if (bodyweight !== undefined && bodyweight !== null) STATE.user.bw = Number(bodyweight);
+    if (level !== undefined && level !== null) STATE.user.level = Number(level);
+    if (xp !== undefined && xp !== null) STATE.user.xp = Number(xp);
+}
+
+async function syncProfileToCloud() {
+    if (!supabaseClient || !STATE.user.id) return;
+
+    const { error } = await supabaseClient.from('profiles').upsert(snapshotProfile(), { onConflict: 'id' });
+    if (error) console.warn('Profile sync failed', error);
+}
+
+async function syncWorkoutToCloud(record) {
+    if (!supabaseClient || !STATE.user.id || !record) return;
+
+    const payload = buildWorkoutPayload(record);
+
+    const { error } = await supabaseClient.from('workout_sets').upsert(payload, { onConflict: 'id' });
+    if (error) console.warn('Workout sync failed', error);
+}
+
+function buildWorkoutPayload(record) {
+    return {
+        id: String(record.id),
+        user_id: STATE.user.id,
+        user_display_name: STATE.user.name || 'Athlete',
+        exercise_id: record.exerciseId,
+        exercise_name: record.exerciseName,
+        muscle: record.muscle || getExerciseById(record.exerciseId)?.muscle || null,
+        weight: Number(record.weight) || 0,
+        reps: Number(record.reps) || 0,
+        one_rm: Number.isFinite(record.oneRM) ? record.oneRM : null,
+        ratio: Number.isFinite(record.ratio) ? record.ratio : null,
+        xp_earned: Number(record.xpEarned) || 0,
+        rank_tier: record.rank?.tier || 'Unranked',
+        created_at: record.date || new Date().toISOString()
+    };
+}
+
+async function migrateLocalDataToCloud() {
+    if (!supabaseClient || !STATE.user.id) return;
+
+    const jobs = [supabaseClient.from('profiles').upsert(snapshotProfile(), { onConflict: 'id' })];
+    const workoutPayloads = STATE.history.map(buildWorkoutPayload);
+
+    if (workoutPayloads.length > 0) {
+        jobs.push(supabaseClient.from('workout_sets').upsert(workoutPayloads, { onConflict: 'id' }));
+    }
+
+    const results = await Promise.all(jobs);
+    results.forEach(result => {
+        if (result?.error) {
+            console.warn('Cloud migration step failed', result.error);
+        }
+    });
+}
+
+async function loadCloudState() {
+    if (!supabaseClient) {
+        STATE.auth.ready = true;
+        return false;
+    }
+
+    const { data, error } = await supabaseClient.auth.getSession();
+    STATE.auth.ready = true;
+    if (error) {
+        console.warn('Auth session check failed', error);
+        return false;
+    }
+
+    const session = data?.session || null;
+    STATE.auth.session = session;
+    if (!session?.user) return false;
+
+    STATE.user.id = session.user.id;
+    STATE.user.email = session.user.email || '';
+    
+    // Fallback to user_metadata if profile row is missing (e.g. first login after email confirmation)
+    const meta = session.user.user_metadata || {};
+    if (meta.display_name && !STATE.user.name) STATE.user.name = meta.display_name;
+    if (meta.age && !STATE.user.age) STATE.user.age = parseInt(meta.age);
+    if (meta.bodyweight && !STATE.user.bw) STATE.user.bw = parseFloat(meta.bodyweight);
+
+    const [{ data: profileRow, error: profileError }, { data: workoutRows, error: workoutError }] = await Promise.all([
+        supabaseClient.from('profiles').select('*').eq('id', session.user.id).maybeSingle(),
+        supabaseClient.from('workout_sets').select('*').eq('user_id', session.user.id).order('created_at', { ascending: false }).limit(500)
+    ]);
+
+    if (profileError) {
+        console.warn('Profile load failed', profileError);
+    } else if (profileRow) {
+        applyProfile(profileRow, meta);
+    } else {
+        applyProfile({
+            id: session.user.id,
+            email: session.user.email,
+            display_name: meta.display_name || 'Athlete',
+            age: meta.age,
+            bodyweight: meta.bodyweight,
+            level: meta.level,
+            xp: meta.xp
+        }, meta);
+        if (STATE.user.bw) {
+            void syncProfileToCloud();
+        }
+    }
+
+    if (!workoutError && Array.isArray(workoutRows)) {
+        STATE.history = workoutRows.map(row => {
+            const ex = getExerciseById(row.exercise_id) || { id: row.exercise_id, name: row.exercise_name, muscle: row.muscle || 'Unknown', multiplier: 1 };
+            const oneRM = Number(row.one_rm) || calc1RM(Number(row.weight), Number(row.reps));
+            const ratio = Number(row.ratio) || getRecordRatio({ exerciseId: row.exercise_id, weight: row.weight, reps: row.reps, oneRM });
+            const rank = oneRM ? getRank(oneRM, STATE.user.bw, ex.multiplier) : { fullName: row.rank_tier || 'Unranked', colorClass: 'rank-unranked', icon: 'user', ratio };
+
+            return {
+                id: Number(row.id) || row.id,
+                date: row.created_at,
+                exerciseId: row.exercise_id,
+                exerciseName: row.exercise_name,
+                muscle: row.muscle,
+                weight: row.weight,
+                reps: row.reps,
+                oneRM,
+                ratio,
+                rank,
+                xpEarned: Number(row.xp_earned) || 0
+            };
+        });
+    }
+
+    persistLocalIdentity();
+    localStorage.setItem('pulse_history', JSON.stringify(STATE.history));
+    return true;
 }
 
 // --- Ranking Math (Expanded to Apex) ---
@@ -367,7 +574,7 @@ window.closeModal = (e) => {
 };
 
 function navigateTo(viewId) {
-    if (!STATE.user.bw && viewId !== 'setup') {
+    if (!STATE.user.bw && viewId !== 'setup' && !STATE.auth.session) {
         viewId = 'setup';
     }
 
@@ -399,6 +606,9 @@ function navigateTo(viewId) {
 const VIEWS = {
     setup: () => {
         let authMode = 'demo'; // 'login', 'register', 'demo'
+        const authStatus = SUPABASE_READY
+            ? 'Cloud auth connected. Passwords stay with Supabase, not localStorage.'
+            : 'Local demo mode only. Add Supabase keys to enable real accounts.';
         
         const renderAuth = () => {
             let formHTML = '';
@@ -429,7 +639,7 @@ const VIEWS = {
                         <label class="input-label">Display Name</label>
                         <input type="text" id="auth-name" class="premium-input" placeholder="Your Name">
                     </div>
-                    <div style="display:flex; gap:16px;">
+                    <div class="auth-row">
                         <div class="input-group anim-fade-in" style="flex:1; animation-delay: 0.15s;">
                             <label class="input-label">Age</label>
                             <input type="number" id="auth-age" class="premium-input" placeholder="e.g. 25">
@@ -447,7 +657,7 @@ const VIEWS = {
                         <label class="input-label">Display Name</label>
                         <input type="text" id="auth-name" class="premium-input" placeholder="Your Name" value="${STATE.user.name}">
                     </div>
-                    <div style="display:flex; gap:16px;">
+                    <div class="auth-row">
                         <div class="input-group anim-fade-in" style="flex:1; animation-delay: 0.05s;">
                             <label class="input-label">Age</label>
                             <input type="number" id="auth-age" class="premium-input" placeholder="e.g. 25" value="${STATE.user.age || ''}">
@@ -463,18 +673,21 @@ const VIEWS = {
 
             $root.innerHTML = `
                 <div class="setup-view anim-fade-in">
-                    <div class="brand-mark" style="width: 64px; height: 64px; font-size: 32px; margin-bottom: 20px;">P</div>
-                    <h1 class="typography-display text-gradient" style="margin-bottom: 8px;">PulseRank</h1>
-                    <p style="margin-bottom: 24px; color:var(--text-secondary);">Gym progress, ranked. Sign in or try the demo.</p>
-                    
-                    <div class="auth-tabs">
-                        <button class="auth-tab ${authMode === 'login' ? 'active' : ''}" onclick="appSetAuthMode('login')">Login</button>
-                        <button class="auth-tab ${authMode === 'register' ? 'active' : ''}" onclick="appSetAuthMode('register')">Register</button>
-                        <button class="auth-tab ${authMode === 'demo' ? 'active' : ''}" onclick="appSetAuthMode('demo')">Demo</button>
-                    </div>
+                    <div class="setup-container">
+                        <div class="brand-mark" style="width: 64px; height: 64px; font-size: 32px; margin-bottom: 20px;">P</div>
+                        <h1 class="typography-display text-gradient" style="margin-bottom: 8px;">PulseRank</h1>
+                        <p style="margin-bottom: 24px; color:var(--text-secondary);">Gym progress, ranked. Sign in or try the demo.</p>
+                        <p style="margin: -12px 0 22px; color: var(--text-tertiary); font-size: 12px;">${authStatus}</p>
+                        
+                        <div class="auth-tabs">
+                            <button class="auth-tab ${authMode === 'login' ? 'active' : ''}" onclick="appSetAuthMode('login')">Login</button>
+                            <button class="auth-tab ${authMode === 'register' ? 'active' : ''}" onclick="appSetAuthMode('register')">Register</button>
+                            <button class="auth-tab ${authMode === 'demo' ? 'active' : ''}" onclick="appSetAuthMode('demo')">Demo</button>
+                        </div>
 
-                    <div class="glass-card" style="width: 100%; max-width: 400px; text-align:left;">
-                        ${formHTML}
+                        <div class="glass-card auth-card">
+                            ${formHTML}
+                        </div>
                     </div>
                 </div>
             `;
@@ -485,7 +698,7 @@ const VIEWS = {
             renderAuth();
         };
 
-        window.appAuthAction = (mode) => {
+        window.appAuthAction = async (mode) => {
             if (mode === 'login') {
                 const email = document.getElementById('auth-email').value;
                 const pass = document.getElementById('auth-pass').value;
@@ -493,7 +706,28 @@ const VIEWS = {
                     showToast("Please enter email and password.");
                     return;
                 }
-                showToast("Database not connected. Use Demo Mode.");
+                if (!supabaseClient) {
+                    showToast("Supabase is not configured. Use Demo Mode or connect credentials.");
+                    return;
+                }
+
+                const { data, error } = await supabaseClient.auth.signInWithPassword({ email, password: pass });
+                if (error) {
+                    showToast(error.message || 'Login failed.');
+                    return;
+                }
+
+                STATE.auth.session = data.session || null;
+                STATE.user.id = data.user?.id || '';
+                STATE.user.email = data.user?.email || email;
+                
+                if (STATE.history.length > 0 || STATE.user.xp > 0) {
+                    await migrateLocalDataToCloud();
+                }
+                
+                await loadCloudState();
+                showToast('Logged in');
+                navigateTo('dashboard');
             } else if (mode === 'register') {
                 const email = document.getElementById('auth-email').value;
                 const pass = document.getElementById('auth-pass').value;
@@ -509,7 +743,45 @@ const VIEWS = {
                     showToast("Please enter a valid age and bodyweight.");
                     return;
                 }
-                showToast("Database not connected. Use Demo Mode.");
+
+                if (!supabaseClient) {
+                    showToast("Supabase is not configured. Use Demo Mode or connect credentials.");
+                    return;
+                }
+
+                const { data, error } = await supabaseClient.auth.signUp({
+                    email,
+                    password: pass,
+                    options: {
+                        data: { display_name: name, age, bodyweight: bw }
+                    }
+                });
+
+                if (error) {
+                    showToast(error.message || 'Registration failed.');
+                    return;
+                }
+
+                if (!data.session) {
+                    showToast('Check your email to confirm the account.');
+                    return;
+                }
+
+                STATE.auth.session = data.session || null;
+                STATE.user.id = data.user?.id || '';
+                STATE.user.email = data.user?.email || email;
+                STATE.user.name = name;
+                STATE.user.age = age;
+                STATE.user.bw = bw;
+                saveState();
+                
+                if (STATE.history.length > 0 || STATE.user.xp > 0) {
+                    await migrateLocalDataToCloud();
+                }
+                
+                await loadCloudState();
+                showToast('Account created');
+                navigateTo('dashboard');
             } else {
                 const name = document.getElementById('auth-name').value;
                 const age = parseInt(document.getElementById('auth-age').value);
@@ -523,6 +795,8 @@ const VIEWS = {
                 STATE.user.name = name || 'Athlete';
                 STATE.user.age = age;
                 STATE.user.bw = bw;
+                STATE.user.id = '';
+                STATE.user.email = '';
                 saveState();
                 showToast("Welcome to PulseRank Demo!");
                 navigateTo('dashboard');
@@ -831,6 +1105,8 @@ const VIEWS = {
                 showToast(`🛡️ Consistency Level Up! Now Level ${STATE.user.level}!`);
             }
             saveState();
+            void syncWorkoutToCloud({ ...record, muscle: ex.muscle });
+            void syncProfileToCloud();
 
             // Refresh UI
             renderSession();
@@ -926,6 +1202,7 @@ const VIEWS = {
             STATE.user.bw = parseFloat(document.getElementById('prof-bw').value) || STATE.user.bw;
             STATE.user.age = parseInt(document.getElementById('prof-age').value) || STATE.user.age;
             saveState();
+            void syncProfileToCloud();
             showToast("Profile Secured");
             
             const meta = document.getElementById('header-meta');
@@ -936,7 +1213,7 @@ const VIEWS = {
             showModal(`
                 <div class="brand-mark" style="width: 64px; height: 64px; font-size: 32px; margin: 0 auto 20px;">P</div>
                 <h2 class="typography-display text-gradient">Log Out</h2>
-                <p style="margin-bottom:24px; color:var(--text-secondary); font-size:14px;">Are you sure you want to log out? This will completely clear your cache and session data from this device.</p>
+                <p style="margin-bottom:24px; color:var(--text-secondary); font-size:14px;">Are you sure you want to log out? This will end the session on this device.</p>
                 <div style="display:flex; gap:12px;">
                     <button class="btn btn-outline" style="flex:1;" onclick="closeModal()">Cancel</button>
                     <button class="btn btn-primary" style="flex:1; background:var(--brand-danger); box-shadow:0 4px 15px rgba(239, 68, 68, 0.4);" onclick="appConfirmLogout()">Log Out</button>
@@ -944,10 +1221,15 @@ const VIEWS = {
             `);
         };
         
-        window.appConfirmLogout = () => {
+        window.appConfirmLogout = async () => {
             closeModal();
-            localStorage.clear();
-            STATE.user = { name: '', age: null, bw: null, level: 1, xp: 0 };
+
+            if (supabaseClient) {
+                await supabaseClient.auth.signOut();
+            }
+
+            clearUserCache();
+            STATE.user = { id: '', email: '', name: '', age: null, bw: null, level: 1, xp: 0 };
             STATE.history = [];
             STATE.currentSessionSets = [];
             saveState();
@@ -955,7 +1237,7 @@ const VIEWS = {
             const meta = document.getElementById('header-meta');
             if (meta) meta.innerHTML = '';
 
-            showToast('Cache cleared. Logged out.');
+            showToast('Logged out.');
             navigateTo('setup');
         };
     }
@@ -984,11 +1266,19 @@ window.appTrainMuscle = (muscle) => {
 };
 
 // --- Init ---
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
     document.querySelector('.brand-pill').addEventListener('click', () => navigateTo('dashboard'));
-    
+
+    if (supabaseClient) {
+        await loadCloudState();
+    } else {
+        STATE.auth.ready = true;
+    }
+
     if (STATE.user.bw) {
         document.getElementById('header-meta').innerHTML = `<span style="font-size:12px; font-weight:600; color:var(--text-secondary); background:rgba(255,255,255,0.1); padding:4px 8px; border-radius:12px;">${STATE.user.bw}kg</span>`;
+    } else {
+        setConnectionStatus(supabaseClient ? 'Cloud ready' : 'Local mode');
     }
 
     document.querySelectorAll('.nav-item').forEach(btn => {
@@ -998,5 +1288,5 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 
-    navigateTo('dashboard');
+    navigateTo(STATE.user.bw ? 'dashboard' : 'setup');
 });
