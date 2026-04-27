@@ -429,7 +429,7 @@ const VIEWS = {
                         <label class="input-label">Display Name</label>
                         <input type="text" id="auth-name" class="premium-input" placeholder="Your Name">
                     </div>
-                    <div style="display:flex; gap:16px;">
+                    <div class="auth-row">
                         <div class="input-group anim-fade-in" style="flex:1; animation-delay: 0.15s;">
                             <label class="input-label">Age</label>
                             <input type="number" id="auth-age" class="premium-input" placeholder="e.g. 25">
@@ -447,7 +447,7 @@ const VIEWS = {
                         <label class="input-label">Display Name</label>
                         <input type="text" id="auth-name" class="premium-input" placeholder="Your Name" value="${STATE.user.name}">
                     </div>
-                    <div style="display:flex; gap:16px;">
+                    <div class="auth-row">
                         <div class="input-group anim-fade-in" style="flex:1; animation-delay: 0.05s;">
                             <label class="input-label">Age</label>
                             <input type="number" id="auth-age" class="premium-input" placeholder="e.g. 25" value="${STATE.user.age || ''}">
@@ -463,18 +463,20 @@ const VIEWS = {
 
             $root.innerHTML = `
                 <div class="setup-view anim-fade-in">
-                    <div class="brand-mark" style="width: 64px; height: 64px; font-size: 32px; margin-bottom: 20px;">P</div>
-                    <h1 class="typography-display text-gradient" style="margin-bottom: 8px;">PulseRank</h1>
-                    <p style="margin-bottom: 24px; color:var(--text-secondary);">Gym progress, ranked. Sign in or try the demo.</p>
-                    
-                    <div class="auth-tabs">
-                        <button class="auth-tab ${authMode === 'login' ? 'active' : ''}" onclick="appSetAuthMode('login')">Login</button>
-                        <button class="auth-tab ${authMode === 'register' ? 'active' : ''}" onclick="appSetAuthMode('register')">Register</button>
-                        <button class="auth-tab ${authMode === 'demo' ? 'active' : ''}" onclick="appSetAuthMode('demo')">Demo</button>
-                    </div>
+                    <div class="setup-container">
+                        <div class="brand-mark" style="width: 64px; height: 64px; font-size: 32px; margin-bottom: 20px;">P</div>
+                        <h1 class="typography-display text-gradient" style="margin-bottom: 8px;">PulseRank</h1>
+                        <p style="margin-bottom: 24px; color:var(--text-secondary);">Gym progress, ranked. Sign in or try the demo.</p>
+                        
+                        <div class="auth-tabs">
+                            <button class="auth-tab ${authMode === 'login' ? 'active' : ''}" onclick="appSetAuthMode('login')">Login</button>
+                            <button class="auth-tab ${authMode === 'register' ? 'active' : ''}" onclick="appSetAuthMode('register')">Register</button>
+                            <button class="auth-tab ${authMode === 'demo' ? 'active' : ''}" onclick="appSetAuthMode('demo')">Demo</button>
+                        </div>
 
-                    <div class="glass-card" style="width: 100%; max-width: 400px; text-align:left;">
-                        ${formHTML}
+                        <div class="glass-card auth-card">
+                            ${formHTML}
+                        </div>
                     </div>
                 </div>
             `;
